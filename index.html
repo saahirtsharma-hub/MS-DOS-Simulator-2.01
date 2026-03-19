@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>MS-DOS Professional v6.22 - Ultimate Edition</title>
+    <style>
+        /* --- CSS: CRT & UI STYLING --- */
+        :root { --dos-green: #33ff33; --dos-bg: #000; --editor-blue: #0000aa; }
+        
+        body, html { 
+            background: #1a1a1a; color: var(--dos-green); 
+            font-family: 'Courier New', Courier, monospace; 
+            margin: 0; padding: 0; height: 100%; overflow: hidden; 
+        }
+
+        #monitor { 
+            background: var(--dos-bg); height: 100vh; padding: 25px; 
+            box-sizing: border-box; overflow-y: auto; position: relative; 
+            box-shadow: inset 0 0 100px rgba(0,0,0,0.8);
+        }
+
+        /* Scanline Overlay */
+        #monitor::after {
+            content: " "; position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+            background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.1) 50%), 
+                        linear-gradient(90deg, rgba(255, 0, 0, 0.03), rgba(0, 255, 0, 0.01), rgba(0, 0, 255, 0.03));
+            background-size: 100% 3px, 3px 100%; pointer-events: none; z-index: 100;
+        }
+
+        .line { margin-bottom: 4px; white-space: pre-wrap; line-height: 1.2; position: relative; z-index: 10; }
+        .error { color: #ff5555; }
+        .success { color: #ffff55; }
+
+        .input-row { display: flex; align-items: center; position: relative; z-index: 10; }
+        #cmd-input { 
+            background: transparent; border: none; color: inherit; 
+            font-family: inherit; font-size: inherit; outline: none; flex: 1; 
+        }
+        #prompt { margin-right: 10px; font-weight: bold; }
+
+        /* --- EDITOR INTERFACE (EDIT.COM STYLE) --- */
+        #editor-ui {
+            display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: var(--editor-blue); color: #fff; z-index: 500; flex-direction: column;
+        }
+        #edit-toolbar { background: #aaaaaa; color: #000; padding: 2px 10px; font-weight: bold; display: flex; justify-content: space-between; }
+        #edit-area { 
+            flex: 1; background: transparent; color: #fff; border: none; padding: 15px; 
+            outline: none; resize: none; font-family: inherit; font-size: 1.1em; line-height: 1.4;
+        }
+        #edit-footer { background: #aaaaaa; color: #000; padding: 2px 10px; font-size: 0.85em; }
+
+        /* Scrollbar Styling */
+        #monitor::-webkit-scrollbar { width: 10px; }
+        #monitor::-webkit-scrollbar-thumb { background: #333; }
+    </style>
+</head>
+<body>
+
+<div id="monitor">
+    <div id="history"></div>
+    <div class="input-row" id="input-container">
+        <span id="prompt">C:\></span>
+        <input type="text" id="cmd-input" autofocus spellcheck="false" autocomplete="off">
+    </div>
+</div>
+
+<!-- Virtual Text Editor -->
+<div id="editor-ui">
+    <div id="edit-toolbar">
+        <span>File: <span id="edit-filename">UNTITLED.TXT</span></span>
+        <span>MS-DOS Editor v2.0</span>
+    </div>
+    <textarea id="edit-area"></textarea>
+    <div id="edit-footer"> [F1] Help | [ESC] Save and Exit | [Line: 1, Col: 1] </div>
+</div>
+
+<script>
+/* 
+=====================================================
+  VIRTUAL FILE SYSTEM & STATE MANAGEMENT
+=====================================================
+*/
+const STORAGE_KEY = "MSDOS_PRO_VFS";
+const historyBox = document.getElementById('history');
+const mainInput = document.getElementById('cmd-input');
+const promptSpan = document.getElementById('prompt');
+const monitor = document.getElementById('monitor');
+const editorUI = document.getElementById('editor-ui');
+const editArea = document.getElementById('edit-area');
+const editFilenameLabel = document.getElementById('edit-filename');
+
+// System state
+let currentPath = ["C:"];
+let isSystemBooted = false;
+let isEditing = false;
+let fileToEdit = "";
+
+// Initial/Default File System
+const DEFAULT_FS = {
+    "C:": {
+        type: "dir",
+        content: {
+            "AUTOEXEC.BAT": { type: "file", data: "@ECHO OFF\nPROMPT $P$G\nCLS", attr: "" },
+            "CONFIG.SYS": { type: "file", data: "FILES=30\nBUFFERS=30", attr: "R" },
+            "COMMAND.COM": { type: "file", data: "SYSTEM BINARY DATA", attr: "H" },
+            "DOS": { 
+                type: "dir", 
+                content: {
+                    "HELP.HLP": { type: "file", data: "DOS Help Database Contents...", attr: "" }
+                } 
+            },
+            "USER": { type: "dir", content: {} }
+        }
+    }
+};
+
+// Load from LocalStorage
+let vfs = JSON.parse(localStorage.getItem(STORAGE_KEY)) || DEFAULT_FS;
+
+function saveSystem() {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(vfs));
+}
+
+function getPointer(pathArr) {
+    let curr = vfs;
+    for (const segment of pathArr) {
+        curr = curr[segment].content;
+    }
+    return curr;
+}
+
+/* 
+=====================================================
+  OUTPUT UTILITIES
+=====================================================
+*/
+function print(text, className = "") {
+    const div = document.createElement('div');
+    div.className = "line " + className;
+    div.textContent = text;
+    historyBox.appendChild(div);
+    monitor.scrollTop = monitor.scrollHeight;
+}
+
+function updatePrompt() {
+    promptSpan.textContent = currentPath.join('\\') + ">";
+}
+
+/* 
+=====================================================
+  COMMAND PROCESSOR
+=====================================================
+*/
+const commands = {
+    'help': () => {
+        print("For more information on a specific command, type HELP command-name");
+        print("CD     - Changes the current directory.");
+        print("CLS    - Clears the screen.");
+        print("COPY   - Copies one or more files to another location.");
+        print("DEL    - Deletes one or more files.");
+        print("DIR    - Displays a list of files and subdirectories.");
+        print("EDIT   - Starts MS-DOS Editor to create/edit text files.");
+        print("FORMAT - Formats a disk for use with MS-DOS.");
+        print("MD     - Creates a directory.");
+        print("MEM    - Displays the amount of used and free memory.");
+        print("MOVE   - Moves files from one directory to another.");
+        print("RD     - Removes a directory.");
+        print("REN    - Renames a file or files.");
+        print("TREE   - Graphically displays the folder structure.");
+        print("TYPE   - Displays the contents of a text file.");
+        print("VER    - Displays the MS-DOS version.");
+    },
+
+    'ver': () => print("Microsoft(R) MS-DOS(R) Version 6.22.2024 (Persistent Storage Active)"),
+
+    'cls': () => { historyBox.innerHTML = ""; return ""; },
+
+    'date': () => print("Current date is " + new Date().toLocaleDateString()),
+
+    'time': () => print("Current time is " + new Date().toLocaleTimeString()),
+
+    'mem': () => {
+        print("Memory Type       Total       Used       Free");
+        print("----------------  ----------  ----------  ----------");
+        print("Conventional       640K        42K        598K");
+        print("Upper                0K         0K          0K");
+        print("Reserved           384K       384K          0K");
+        print("Extended (XMS)   15,360K     2,048K     13,312K");
+        print("----------------  ----------  ----------  ----------");
+        print("Total memory     16,384K     2,474K     13,910K");
+    },
+
+    'dir': () => {
+        const dir = getPointer(currentPath);
+        print(` Volume in drive C is MS-DOS_PRO`);
+        print(` Directory of ${currentPath.join('\\')}\n`);
+        
+        let fCount = 0, dCount = 0, byteSize = 0;
+        
+        Object.keys(dir).forEach(name => {
+            const item = dir[name];
+            const timestamp = "03-18-24  08:37p";
+            const info = item.type === "dir" ? "<DIR>     " : item.data.length.toString().padStart(10);
+            print(`${name.padEnd(12)} ${info}  ${timestamp}`);
+            if (item.type === "dir") dCount++; 
+            else { fCount++; byteSize += item.data.length; }
+        });
+
+        print(`\n       ${fCount} file(s)      ${byteSize} bytes`);
+        print(`       ${dCount} dir(s)       14,233,600 bytes free`);
+    },
+
+    'md': (args) => {
+        if (!args[0]) return print("Required parameter missing", "error");
+        const dir = getPointer(currentPath);
+        const name = args[0].toUpperCase();
+        if (dir[name]) return print("Directory already exists", "error");
+        dir[name] = { type: "dir", content: {}, attr: "" };
+        saveSystem();
+    },
+
+    'mkdir': (args) => commands.md(args),
+
+    'cd': (args) => {
+        const target = args[0]?.toUpperCase();
+        if (!target || target === "\\") { currentPath = ["C:"]; }
+        else if (target === "..") { if (currentPath.length > 1) currentPath.pop(); }
+        else {
+            const dir = getPointer(currentPath);
+            if (dir[target] && dir[target].type === "dir") {
+                currentPath.push(target);
+            } else {
+                print("Invalid directory", "error");
+            }
+        }
+        updatePrompt();
+    },
+
+    'rd': (args) => {
+        if (!args[0]) return print("Directory name required", "error");
+        const name = args[0].toUpperCase();
+        const dir = getPointer(currentPath);
+        if (dir[name] && dir[name].type === "dir") {
+            delete dir[name];
+            saveSystem();
+        } else print("Invalid directory", "error");
+    },
+
+    'del': (args) => {
+        if (!args[0]) return print("File name required", "error");
+        const name = args[0].toUpperCase();
+        const dir = getPointer(currentPath);
+        if (dir[name] && dir[name].type === "file") {
+            delete dir[name];
+            saveSystem();
+        } else print("File not found", "error");
+    },
+
+    'ren': (args) => {
+        if (args.length < 2) return print("Usage: REN [old] [new]", "error");
+        const dir = getPointer(currentPath);
+        const [oldN, newN] = [args[0].toUpperCase(), args[1].toUpperCase()];
+        if (dir[oldN]) {
+            dir[newN] = dir[oldN];
+            delete dir[oldN];
+            saveSystem();
+        } else print("File not found", "error");
+    },
+
+    'move': (args) => {
+        if (args.length < 2) return print("Usage: MOVE [file] [dest_dir]", "error");
+        const dir = getPointer(currentPath);
+        const fileName = args[0].toUpperCase();
+        const destName = args[1].toUpperCase();
+        if (dir[fileName] && dir[destName] && dir[destName].type === "dir") {
+            dir[destName].content[fileName] = dir[fileName];
+            delete dir[fileName];
+            saveSystem();
+            print("1 file(s) moved.");
+        } else print("Invalid source or destination", "error");
+    },
+
+    'type': (args) => {
+        if (!args[0]) return print("Usage: TYPE [filename]");
+        const file = getDirFile(args[0].toUpperCase());
+        if (file) print(file.data);
+        else print("File not found", "error");
+    },
+
+    'tree': () => {
+        function draw(node, indent = "") {
+            let res = "";
+            for (let k in node) {
+                res += indent + "|--" + k + "\n";
+                if (node[k].type === "dir") res += draw(node[k].content, indent + "|  ");
+            }
+            return res;
+        }
+        print("C:\n" + draw(vfs["C:"].content));
+    },
+
+    'edit': (args) => {
+        if (!args[0]) return print("Usage: EDIT [filename]");
+        const name = args[0].toUpperCase();
+        const dir = getPointer(currentPath);
+        
+        fileToEdit = name;
+        isEditing = true;
+        editFilenameLabel.textContent = name;
+        editArea.value = dir[name] ? dir[name].data : "";
+        
+        editorUI.style.display = "flex";
+        editArea.focus();
+    },
+
+    'format': (args) => {
+        if (args[0]?.toUpperCase() === "C:") {
+            if (confirm("WARNING: ALL DATA ON NON-REMOVABLE DISK DRIVE C: WILL BE LOST!\nProceed with Format (Y/N)?")) {
+                localStorage.removeItem(STORAGE_KEY);
+                location.reload();
+            }
+        } else print("Usage: FORMAT C:");
+    }
+};
+
+/* 
+=====================================================
+  SYSTEM LOGIC & EVENT HANDLERS
+=====================================================
+*/
+function getDirFile(name) {
+    const dir = getPointer(currentPath);
+    return (dir[name] && dir[name].type === "file") ? dir[name] : null;
+}
+
+mainInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        const val = mainInput.value.trim();
+        const parts = val.split(/\s+/);
+        const cmd = parts[0].toLowerCase();
+        const args = parts.slice(1);
+
+        print(promptSpan.textContent + val);
+
+        if (cmd) {
+            if (commands[cmd]) {
+                const res = commands[cmd](args);
+                if (res) print(res);
+            } else {
+                print(`Bad command or file name: '${cmd}'`, "error");
+            }
+        }
+        mainInput.value = "";
+        monitor.scrollTop = monitor.scrollHeight;
+    }
+});
+
+// Handling the Editor Exit (ESC Key)
+editArea.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+        const dir = getPointer(currentPath);
+        dir[fileToEdit] = { type: "file", data: editArea.value, attr: "" };
+        saveSystem();
+        
+        isEditing = false;
+        editorUI.style.display = "none";
+        mainInput.focus();
+        print(`C:\\>${fileToEdit} saved successfully.`, "success");
+    }
+});
+
+// Boot Logic
+function bootSequence() {
+    print("Phoenix BIOS 4.0 Release 6.0");
+    print("Copyright 1985-1994 Phoenix Technologies Ltd.");
+    print("All Rights Reserved\n");
+    
+    setTimeout(() => print("CPU: Intel 80486DX-33"), 300);
+    setTimeout(() => print("Memory Test: 16384K OK"), 700);
+    setTimeout(() => print("Fixed Disk 0: VIRTUAL-DISK-01"), 1000);
+    
+    setTimeout(() => {
+        print("\nStarting MS-DOS...");
+        print("\nMicrosoft(R) MS-DOS(R) Version 6.22");
+        print("(C)Copyright Microsoft Corp 1981-1994.");
+        print("Virtual Drive C: Persistence Loaded.");
+        print("Type 'HELP' for a list of commands.\n");
+        isSystemBooted = true;
+        updatePrompt();
+    }, 1800);
+}
+
+// Global click to focus
+window.onclick = () => { if (!isEditing) mainInput.focus(); };
+
+// Run boot
+bootSequence();
+
+</script>
+</body>
+</html>
